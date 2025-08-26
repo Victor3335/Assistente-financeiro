@@ -53,9 +53,7 @@ async function ensureTables() {
 function normalize(s) { return (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
 
 function extractIntent(text) {
-  // Heurística simples para MVP: pega uma operação conhecida e tenta detectar o equipamento (modelo + marca)
   const t = normalize(text);
-  // operações comuns
   const OPS = [
     "troca de rolamento","troca do rolamento","rolamento",
     "troca de correia","correia",
@@ -65,35 +63,28 @@ function extractIntent(text) {
   ];
   let operacao = OPS.find(op => t.includes(op)) || "";
   if (!operacao && t.startsWith("troca de ")) {
-    // pega as 2-3 palavras após "troca de"
     const after = t.replace(/^troca de\s+/, "");
     operacao = "troca de " + after.split(/\s+/).slice(0, 2).join(" ");
   }
 
-  // equipamento: tenta capturar MODELO + MARCA (últimas 2-3 palavras)
-  // exemplo: "rre160hcc toyota"
   const tokens = t.split(/\s+/).filter(Boolean);
   let equipamento = "";
   const knownBrands = ["toyota","hyster","yale","jungheinrich","crown","linde","still","komatsu","mitsubishi","tcm","doosan"];
   const brand = tokens.find(w => knownBrands.includes(w));
   if (brand) {
-    // pega algo que pareça modelo antes da marca (letras/números/traço)
     const idx = tokens.lastIndexOf(brand);
     const maybeModel = tokens.slice(Math.max(0, idx-1), idx).join(" ").toUpperCase();
     equipamento = ((maybeModel || "").trim() + " " + brand).trim();
   } else {
-    // fallback: as últimas 2-3 palavras
     equipamento = tokens.slice(-2).join(" ");
   }
 
-  // saneamento
   operacao = operacao.trim();
   equipamento = equipamento.trim();
   return { operacao, equipamento };
 }
 
 async function searchManutencoes({ operacao, equipamento }) {
-  // busca flexível com ILIKE
   const op = operacao ? `%${operacao}%` : "%";
   const eq = equipamento ? `%${equipamento}%` : "%";
   const { rows } = await pool.query(
@@ -116,6 +107,23 @@ async function insertManutencao({ operacao, equipamento, descricao, fotos, criad
   return rows[0];
 }
 
+// ====== PROXY DE MÍDIA (Twilio -> público) ======
+app.get("/media/proxy", async (req, res) => {
+  try {
+    const u = req.query.u;
+    if (!u) return res.status(400).send("missing u");
+    const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64");
+    const r = await fetch(u, { headers: { Authorization: `Basic ${auth}` } });
+    if (!r.ok) return res.status(502).send("twilio fetch error");
+    res.set("Content-Type", r.headers.get("content-type") || "application/octet-stream");
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.send(buf);
+  } catch (e) {
+    console.error("media proxy error", e);
+    res.status(500).send("proxy error");
+  }
+});
+
 // ====== HEALTH ======
 app.get("/health", (_, res) => res.json({ ok: true }));
 
@@ -127,9 +135,8 @@ app.post("/twilio/webhook", async (req, res) => {
     const numMedia = Number(req.body.NumMedia || 0);
     console.log("TWILIO IN:", { From: from, Body: body, NumMedia: numMedia });
 
-    // Se vier MÍDIA: tratamos como CADASTRO/ATUALIZAÇÃO
+    // Se vier MÍDIA: CADASTRO/ATUALIZAÇÃO
     if (numMedia > 0) {
-      // colete as URLs das mídias (Twilio envia MediaUrl0..MediaUrlN)
       const fotos = [];
       for (let i = 0; i < Math.min(numMedia, 10); i++) {
         const url = req.body[`MediaUrl${i}`];
@@ -176,23 +183,20 @@ Você pode *cadastrar* enviando foto(s) + o texto da operação/equipamento.</Me
       );
     }
 
-    // Monta resposta: envia 1º registro como texto + até 3 fotos
+    // Monta resposta: envia 1º registro como texto + fotos via PROXY público
     const r = results[0];
     const descricao = r.descricao || "(sem descrição)";
-    const header = `🔧 Procedimento encontrado
+    const base = process.env.PUBLIC_BASE_URL || "";
+
+    let twiml = `<Response><Message>🔧 Procedimento encontrado
 Operação: ${r.operacao}
 Equipamento: ${r.equipamento}
-Descrição: ${descricao}`;
+Descrição: ${descricao}</Message>`;
 
-    // TwiML: podemos mandar texto + imagens (uma mensagem por vez; enviamos uma com texto e outra com mídias)
-    let twiml = `<Response><Message>${header}</Message>`;
-    if (Array.isArray(r.fotos)) {
-      const fotos = r.fotos.slice(0, 5); // limite por segurança
-      if (fotos.length > 0) {
-        // Uma nova mensagem só com mídias (Twilio aceita múltiplos <Media>)
-        twiml += `<Message>`;
-        for (const f of fotos) twiml += `<Media>${f}</Media>`;
-        twiml += `</Message>`;
+    if (Array.isArray(r.fotos) && r.fotos.length > 0 && base) {
+      for (const f of r.fotos.slice(0, 5)) {
+        const proxied = `${base}/media/proxy?u=${encodeURIComponent(f)}`;
+        twiml += `<Message><Media>${proxied}</Media></Message>`;
       }
     }
     twiml += `</Response>`;
@@ -213,3 +217,4 @@ app.listen(PORT, async () => {
   console.log("Servidor rodando na porta", PORT);
   try { await ensureTables(); } catch (e) { console.error(e); }
 });
+
