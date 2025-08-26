@@ -3,7 +3,7 @@ const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // Twilio usa form-encoded
+app.use(express.urlencoded({ extended: true })); // Twilio envia form-encoded
 
 // ====== DB ======
 const pool = new Pool({
@@ -50,7 +50,9 @@ async function ensureTables() {
 }
 
 // ====== helpers manutenção ======
-function normalize(s) { return (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+function normalize(s) {
+  return (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
 
 function extractIntent(text) {
   const t = normalize(text);
@@ -67,21 +69,20 @@ function extractIntent(text) {
     operacao = "troca de " + after.split(/\s+/).slice(0, 2).join(" ");
   }
 
+  // equipamento: tenta "MODELO MARCA" (ex.: RRE160HCC toyota)
   const tokens = t.split(/\s+/).filter(Boolean);
   let equipamento = "";
   const knownBrands = ["toyota","hyster","yale","jungheinrich","crown","linde","still","komatsu","mitsubishi","tcm","doosan"];
   const brand = tokens.find(w => knownBrands.includes(w));
   if (brand) {
     const idx = tokens.lastIndexOf(brand);
-    const maybeModel = tokens.slice(Math.max(0, idx-1), idx).join(" ").toUpperCase();
+    const maybeModel = tokens.slice(Math.max(0, idx - 1), idx).join(" ").toUpperCase();
     equipamento = ((maybeModel || "").trim() + " " + brand).trim();
   } else {
-    equipamento = tokens.slice(-2).join(" ");
+    equipamento = tokens.slice(-2).join(" "); // fallback
   }
 
-  operacao = operacao.trim();
-  equipamento = equipamento.trim();
-  return { operacao, equipamento };
+  return { operacao: (operacao || "").trim(), equipamento: (equipamento || "").trim() };
 }
 
 async function searchManutencoes({ operacao, equipamento }) {
@@ -112,9 +113,14 @@ app.get("/media/proxy", async (req, res) => {
   try {
     const u = req.query.u;
     if (!u) return res.status(400).send("missing u");
+
     const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64");
     const r = await fetch(u, { headers: { Authorization: `Basic ${auth}` } });
-    if (!r.ok) return res.status(502).send("twilio fetch error");
+    if (!r.ok) {
+      console.error("media proxy twilio fetch error", r.status, r.statusText);
+      return res.status(502).send("twilio fetch error");
+    }
+
     res.set("Content-Type", r.headers.get("content-type") || "application/octet-stream");
     const buf = Buffer.from(await r.arrayBuffer());
     res.send(buf);
@@ -135,14 +141,16 @@ app.post("/twilio/webhook", async (req, res) => {
     const numMedia = Number(req.body.NumMedia || 0);
     console.log("TWILIO IN:", { From: from, Body: body, NumMedia: numMedia });
 
-    // Se vier MÍDIA: CADASTRO/ATUALIZAÇÃO
+    // ===== CADASTRO/ATUALIZAÇÃO (com mídia) =====
     if (numMedia > 0) {
       const fotos = [];
       for (let i = 0; i < Math.min(numMedia, 10); i++) {
         const url = req.body[`MediaUrl${i}`];
         const ctype = req.body[`MediaContentType${i}`] || "";
+        // se quiser permitir vídeo também, remova o startsWith("image/")
         if (url && ctype.startsWith("image/")) fotos.push(url);
       }
+      console.log("FOTOS RECEBIDAS:", fotos);
 
       const { operacao, equipamento } = extractIntent(body);
       if (!operacao || !equipamento) {
@@ -166,7 +174,7 @@ Fotos: ${saved.fotos.length}</Message></Response>`
       );
     }
 
-    // Sem mídia → CONSULTA
+    // ===== CONSULTA (sem mídia) =====
     const q = extractIntent(body);
     if (!q.operacao && !q.equipamento) {
       res.set("Content-Type", "text/xml");
@@ -183,20 +191,29 @@ Você pode *cadastrar* enviando foto(s) + o texto da operação/equipamento.</Me
       );
     }
 
-    // Monta resposta: envia 1º registro como texto + fotos via PROXY público
+    // monta resposta (texto + fotos via proxy)
     const r = results[0];
     const descricao = r.descricao || "(sem descrição)";
     const base = process.env.PUBLIC_BASE_URL || "";
+
+    console.log("MANUT FOUND:", {
+      equipamento: r.equipamento,
+      operacao: r.operacao,
+      fotos: Array.isArray(r.fotos) ? r.fotos.length : 0,
+      base
+    });
 
     let twiml = `<Response><Message>🔧 Procedimento encontrado
 Operação: ${r.operacao}
 Equipamento: ${r.equipamento}
 Descrição: ${descricao}</Message>`;
 
-    if (Array.isArray(r.fotos) && r.fotos.length > 0 && base) {
+    if (Array.isArray(r.fotos) && r.fotos.length > 0) {
       for (const f of r.fotos.slice(0, 5)) {
-        const proxied = `${base}/media/proxy?u=${encodeURIComponent(f)}`;
-        twiml += `<Message><Media>${proxied}</Media></Message>`;
+        const mediaUrl = base
+          ? `${base}/media/proxy?u=${encodeURIComponent(f)}`
+          : f; // fallback (pode falhar se a URL do Twilio exigir Auth)
+        twiml += `<Message><Media>${mediaUrl}</Media></Message>`;
       }
     }
     twiml += `</Response>`;
