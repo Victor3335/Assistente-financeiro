@@ -2,9 +2,8 @@ const express = require("express");
 const { Pool } = require("pg");
 
 const app = express();
-// Twilio manda x-www-form-urlencoded
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true })); // Twilio usa form-encoded
 
 // ====== DB ======
 const pool = new Pool({
@@ -35,121 +34,176 @@ async function ensureTables() {
       created_at TIMESTAMP DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, occurred_at);
+
+    CREATE TABLE IF NOT EXISTS manutencoes (
+      id SERIAL PRIMARY KEY,
+      equipamento TEXT NOT NULL,
+      operacao TEXT NOT NULL,
+      descricao TEXT,
+      fotos TEXT[],
+      criado_por TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_manut_enc ON manutencoes (equipamento, operacao);
   `);
   console.log("Tabelas prontas ✅");
 }
 
-async function upsertUser(waNumber) {
+// ====== helpers manutenção ======
+function normalize(s) { return (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+
+function extractIntent(text) {
+  // Heurística simples para MVP: pega uma operação conhecida e tenta detectar o equipamento (modelo + marca)
+  const t = normalize(text);
+  // operações comuns
+  const OPS = [
+    "troca de rolamento","troca do rolamento","rolamento",
+    "troca de correia","correia",
+    "troca de oleo","oleo","troca de óleo",
+    "troca de filtro","filtro",
+    "bateria","pastilha","sapata","corrente","mastro"
+  ];
+  let operacao = OPS.find(op => t.includes(op)) || "";
+  if (!operacao && t.startsWith("troca de ")) {
+    // pega as 2-3 palavras após "troca de"
+    const after = t.replace(/^troca de\s+/, "");
+    operacao = "troca de " + after.split(/\s+/).slice(0, 2).join(" ");
+  }
+
+  // equipamento: tenta capturar MODELO + MARCA (últimas 2-3 palavras)
+  // exemplo: "rre160hcc toyota"
+  const tokens = t.split(/\s+/).filter(Boolean);
+  let equipamento = "";
+  const knownBrands = ["toyota","hyster","yale","jungheinrich","crown","linde","still","komatsu","mitsubishi","tcm","doosan"];
+  const brand = tokens.find(w => knownBrands.includes(w));
+  if (brand) {
+    // pega algo que pareça modelo antes da marca (letras/números/traço)
+    const idx = tokens.lastIndexOf(brand);
+    const maybeModel = tokens.slice(Math.max(0, idx-1), idx).join(" ").toUpperCase();
+    equipamento = ((maybeModel || "").trim() + " " + brand).trim();
+  } else {
+    // fallback: as últimas 2-3 palavras
+    equipamento = tokens.slice(-2).join(" ");
+  }
+
+  // saneamento
+  operacao = operacao.trim();
+  equipamento = equipamento.trim();
+  return { operacao, equipamento };
+}
+
+async function searchManutencoes({ operacao, equipamento }) {
+  // busca flexível com ILIKE
+  const op = operacao ? `%${operacao}%` : "%";
+  const eq = equipamento ? `%${equipamento}%` : "%";
   const { rows } = await pool.query(
-    `INSERT INTO users (wa_number) VALUES ($1)
-     ON CONFLICT (wa_number) DO UPDATE SET wa_number = EXCLUDED.wa_number
+    `SELECT * FROM manutencoes
+     WHERE operacao ILIKE $1 AND equipamento ILIKE $2
+     ORDER BY created_at DESC
+     LIMIT 5;`,
+    [op, eq]
+  );
+  return rows;
+}
+
+async function insertManutencao({ operacao, equipamento, descricao, fotos, criado_por }) {
+  const { rows } = await pool.query(
+    `INSERT INTO manutencoes (operacao, equipamento, descricao, fotos, criado_por)
+     VALUES ($1,$2,$3,$4,$5)
      RETURNING *;`,
-    [waNumber]
+    [operacao, equipamento, descricao || null, fotos || [], criado_por || null]
   );
   return rows[0];
-}
-
-async function insertTx(userId, { type, value_cents, category, note }) {
-  await pool.query(
-    `INSERT INTO transactions (user_id, type, value_cents, category, note, occurred_at)
-     VALUES ($1,$2,$3,$4,$5, CURRENT_DATE);`,
-    [userId, type, value_cents, category, note || null]
-  );
-}
-
-async function getSummaryMTD(userId) {
-  const now = new Date();
-  const first = new Date(now.getFullYear(), now.getMonth(), 1);
-  const next = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  const pad = (n) => n.toString().padStart(2, "0");
-  const f = `${first.getFullYear()}-${pad(first.getMonth() + 1)}-${pad(first.getDate())}`;
-  const n = `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}`;
-
-  const { rows } = await pool.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN type='income' THEN value_cents END),0) as income,
-       COALESCE(SUM(CASE WHEN type='expense' THEN value_cents END),0) as spent
-     FROM transactions
-     WHERE user_id=$1 AND occurred_at >= $2 AND occurred_at < $3;`,
-    [userId, f, n]
-  );
-  const income = Number(rows[0].income || 0);
-  const spent = Number(rows[0].spent || 0);
-  return { income, spent, balance: income - spent };
-}
-
-// ====== NLU simples ======
-function parseMoneyBR(text) {
-  const m = (text || "").match(/(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?|\d+(?:\.\d{1,2})?)/);
-  if (!m) return null;
-  const raw = m[1].replace(/\./g, "").replace(",", ".");
-  const v = Number(raw);
-  return isNaN(v) ? null : v;
-}
-function inferCategory(s) {
-  const t = (s || "").toLowerCase();
-  if (/mercado|supermercado|ifood|comida|restaurante|lanche/.test(t)) return "alimentação";
-  if (/gasolina|combust/i.test(t)) return "combustível";
-  if (/aluguel/.test(t)) return "moradia";
-  if (/luz|energia/.test(t)) return "energia";
-  if (/internet|claro|vivo|tim|net/.test(t)) return "internet";
-  return "outros";
 }
 
 // ====== HEALTH ======
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ====== TWILIO WEBHOOK (WhatsApp Sandbox) ======
+// ====== TWILIO WEBHOOK (texto + mídia) ======
 app.post("/twilio/webhook", async (req, res) => {
   try {
-    console.log("TWILIO IN:", { From: req.body.From, Body: req.body.Body });
-
     const body = req.body.Body || "";
     const from = (req.body.From || "").replace("whatsapp:", "");
-    if (!from) {
-      res.set("Content-Type", "text/xml");
-      return res.send(`<Response><Message>Sem remetente</Message></Response>`);
-    }
+    const numMedia = Number(req.body.NumMedia || 0);
+    console.log("TWILIO IN:", { From: from, Body: body, NumMedia: numMedia });
 
-    const user = await upsertUser(from);
-    const text = body.trim().toLowerCase();
-
-    const isDespesa   = /(gastei|paguei|compra|despesa)/.test(text);
-    const isSaldo     = /\b(saldo|quanto gastei|resumo|extrato)\b/.test(text);
-    const isRelatorio = /relat[óo]rio/.test(text);
-    const isPix       = /\bpix\b/.test(text);
-
-    let reply = 'Comandos: "gastei 35 no mercado", "saldo", "relatório", "pix 120 barbeiro"';
-
-    if (isDespesa) {
-      const v = parseMoneyBR(text);
-      if (!v) {
-        reply = 'Não entendi o valor. Ex.: "gastei 47,90 no mercado"';
-      } else {
-        const cat = inferCategory(text);
-        await insertTx(user.id, { type: "expense", value_cents: Math.round(v * 100), category: cat, note: body });
-        reply = `Anotado ✅ Despesa de R$ ${v.toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em ${cat}.`;
+    // Se vier MÍDIA: tratamos como CADASTRO/ATUALIZAÇÃO
+    if (numMedia > 0) {
+      // colete as URLs das mídias (Twilio envia MediaUrl0..MediaUrlN)
+      const fotos = [];
+      for (let i = 0; i < Math.min(numMedia, 10); i++) {
+        const url = req.body[`MediaUrl${i}`];
+        const ctype = req.body[`MediaContentType${i}`] || "";
+        if (url && ctype.startsWith("image/")) fotos.push(url);
       }
-    } else if (isSaldo || isRelatorio) {
-      const s = await getSummaryMTD(user.id);
-      const income = (s.income / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
-      const spent  = (s.spent  / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
-      const bal    = (s.balance/ 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
-      reply = `Resumo do mês:\nReceitas: ${income}\nDespesas: ${spent}\nSaldo: ${bal}`;
-    } else if (isPix) {
-      const v = parseMoneyBR(text);
-      reply = v
-        ? `Pronto! Link de cobrança (simulada): https://pix.local/charge/${Math.random().toString(36).slice(2,8)}?v=${v}`
-        : 'Informe o valor. Ex.: "pix 120 barbeiro"';
+
+      const { operacao, equipamento } = extractIntent(body);
+      if (!operacao || !equipamento) {
+        res.set("Content-Type", "text/xml");
+        return res.send(`<Response><Message>Para cadastrar, envie *foto(s)* junto com um texto contendo a operação e o equipamento. Ex.: "troca de rolamento RRE160HCC Toyota"</Message></Response>`);
+      }
+
+      const saved = await insertManutencao({
+        operacao, equipamento,
+        descricao: body,
+        fotos,
+        criado_por: from
+      });
+
+      res.set("Content-Type", "text/xml");
+      return res.send(
+        `<Response><Message>✅ Procedimento salvo:
+Operação: ${saved.operacao}
+Equipamento: ${saved.equipamento}
+Fotos: ${saved.fotos.length}</Message></Response>`
+      );
     }
 
-    // >>> Respondendo DIRETO ao Twilio via TwiML (sem chamar outra API)
+    // Sem mídia → CONSULTA
+    const q = extractIntent(body);
+    if (!q.operacao && !q.equipamento) {
+      res.set("Content-Type", "text/xml");
+      return res.send(`<Response><Message>Me diga o que precisa. Ex.: "troca de rolamento RRE160HCC Toyota".
+Se quiser *cadastrar* um procedimento novo, envie *foto(s)* + a frase acima.</Message></Response>`);
+    }
+
+    const results = await searchManutencoes(q);
+    if (results.length === 0) {
+      res.set("Content-Type", "text/xml");
+      return res.send(
+        `<Response><Message>Não encontrei "${q.operacao || "operação"}" para "${q.equipamento || "equipamento"}".
+Você pode *cadastrar* enviando foto(s) + o texto da operação/equipamento.</Message></Response>`
+      );
+    }
+
+    // Monta resposta: envia 1º registro como texto + até 3 fotos
+    const r = results[0];
+    const descricao = r.descricao || "(sem descrição)";
+    const header = `🔧 Procedimento encontrado
+Operação: ${r.operacao}
+Equipamento: ${r.equipamento}
+Descrição: ${descricao}`;
+
+    // TwiML: podemos mandar texto + imagens (uma mensagem por vez; enviamos uma com texto e outra com mídias)
+    let twiml = `<Response><Message>${header}</Message>`;
+    if (Array.isArray(r.fotos)) {
+      const fotos = r.fotos.slice(0, 5); // limite por segurança
+      if (fotos.length > 0) {
+        // Uma nova mensagem só com mídias (Twilio aceita múltiplos <Media>)
+        twiml += `<Message>`;
+        for (const f of fotos) twiml += `<Media>${f}</Media>`;
+        twiml += `</Message>`;
+      }
+    }
+    twiml += `</Response>`;
+
     res.set("Content-Type", "text/xml");
-    res.send(`<Response><Message>${reply}</Message></Response>`);
+    return res.send(twiml);
+
   } catch (e) {
     console.error("twilio webhook error", e);
     res.set("Content-Type", "text/xml");
-    res.send(`<Response><Message>Erro temporário. Tente novamente.</Message></Response>`);
+    return res.send(`<Response><Message>Erro temporário no assistente. Tente novamente em instantes.</Message></Response>`);
   }
 });
 
